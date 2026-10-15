@@ -252,7 +252,10 @@ class VendaViewSet(viewsets.ModelViewSet):
 
         with transaction.atomic():
             venda = get_object_or_404(
-                Venda.objects.select_for_update().select_related('sessao', 'cliente'),
+                # Não inclua `cliente` neste lock. A relação é opcional e, no
+                # PostgreSQL, gera um LEFT OUTER JOIN no qual SELECT FOR UPDATE
+                # não pode bloquear o lado anulável da junção.
+                Venda.objects.select_for_update().select_related('sessao'),
                 pk=pk,
             )
             _assert_sale_owner(venda, request.user)
@@ -268,8 +271,10 @@ class VendaViewSet(viewsets.ModelViewSet):
             total = sum((item.subtotal for item in itens), Decimal('0')).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
-            if desconto > total:
-                return Response({'erro': 'O desconto não pode ser maior que o total da venda.'}, status=400)
+            if desconto >= total:
+                return Response({
+                    'erro': 'O desconto deve manter o total líquido da venda em pelo menos R$0,01.'
+                }, status=400)
 
             total_liquido = (total - desconto).quantize(Decimal('0.01'))
             total_pago = sum((p['valor'] for p in pagamentos_data), Decimal('0')).quantize(Decimal('0.01'))

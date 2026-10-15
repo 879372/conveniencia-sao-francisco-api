@@ -48,6 +48,52 @@ def test_finalizar_venda_sucesso(auth_client, admin_user):
     assert venda.pagamentos.count() == 1
     assert venda.pagamentos.first().forma == "DINHEIRO"
 
+
+@pytest.mark.django_db
+def test_finalizar_venda_nao_bloqueia_join_opcional_de_cliente(auth_client, admin_user):
+    """Evita o LEFT JOIN bloqueado que causa 500 no PostgreSQL.
+
+    O SQLite não reproduz o erro ``FOR UPDATE cannot be applied to the nullable
+    side of an outer join``. Por isso a regressão também inspeciona o SQL da
+    finalização e garante que a tabela de clientes não volte ao queryset
+    bloqueado. A cobertura real do lock concorrente continua pertencendo aos
+    testes de integração em PostgreSQL.
+    """
+    sessao = SessaoCaixaFactory(operador=admin_user, status='ABERTA')
+    venda = VendaFactory(sessao=sessao, cliente=None, status='EM_ABERTO')
+    estoque = EstoqueLojaFactory(
+        quantidade=Decimal('2.00'), loja='Loja Principal', produto__preco_venda=Decimal('10.00')
+    )
+    VendaItemFactory(
+        venda=venda,
+        produto=estoque.produto,
+        quantidade=Decimal('1.00'),
+        preco_unitario=Decimal('10.00'),
+    )
+
+    captured_sql = []
+
+    def capture(execute, sql, params, many, context):
+        captured_sql.append(sql)
+        return execute(sql, params, many, context)
+
+    from django.db import connection
+
+    with connection.execute_wrapper(capture):
+        response = auth_client.post(
+            f'/api/vendas/{venda.id}/finalizar/',
+            {'pagamentos': [{'forma': 'DINHEIRO', 'valor': '10.00'}]},
+            format='json',
+        )
+
+    assert response.status_code == 200
+    sale_lock_queries = [
+        sql for sql in captured_sql
+        if 'vendas_venda' in sql.lower() and 'vendas_sessaocaixa' in sql.lower()
+    ]
+    assert sale_lock_queries
+    assert all('clientes_cliente' not in sql.lower() for sql in sale_lock_queries)
+
 @pytest.mark.django_db
 def test_finalizar_venda_total_divergente(auth_client, admin_user):
     """
@@ -68,6 +114,31 @@ def test_finalizar_venda_total_divergente(auth_client, admin_user):
 
     assert response.status_code == 400
     assert "não atinge" in response.data['erro']
+
+
+@pytest.mark.django_db
+def test_finalizar_rejeita_desconto_igual_ao_total(auth_client, admin_user):
+    sessao = SessaoCaixaFactory(operador=admin_user, status='ABERTA')
+    venda = VendaFactory(sessao=sessao, status='EM_ABERTO')
+    produto = ProdutoFactory(preco_venda=Decimal('10.00'))
+    VendaItemFactory(
+        venda=venda,
+        produto=produto,
+        quantidade=Decimal('1.00'),
+        preco_unitario=Decimal('10.00'),
+    )
+
+    response = auth_client.post(
+        f'/api/vendas/{venda.id}/finalizar/',
+        {'pagamentos': [{'forma': 'DINHEIRO', 'valor': '0.01'}], 'desconto': '10.00'},
+        format='json',
+    )
+
+    assert response.status_code == 400
+    assert 'R$0,01' in response.data['erro']
+    venda.refresh_from_db()
+    assert venda.status == 'EM_ABERTO'
+    assert venda.pagamentos.count() == 0
 
 
 @pytest.mark.django_db
