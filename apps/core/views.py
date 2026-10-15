@@ -1,5 +1,5 @@
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from django.db import connection
 from django.db.models import Sum, Avg, Count, Q
@@ -30,7 +30,7 @@ def health_check(request):
 
 
 @api_view(["GET"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def dashboard_stats(request):
     """
     Retorna estatísticas consolidadas para o dashboard.

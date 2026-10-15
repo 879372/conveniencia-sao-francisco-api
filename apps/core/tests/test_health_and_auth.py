@@ -18,3 +18,9 @@ def test_login_jwt(api_client, admin_user):
     assert response.status_code == 200
     assert response.data['access']
     assert response.data['refresh']
+
+
+@pytest.mark.django_db
+def test_dashboard_exige_autenticacao(api_client):
+    response = api_client.get('/api/dashboard-stats/')
+    assert response.status_code == 401

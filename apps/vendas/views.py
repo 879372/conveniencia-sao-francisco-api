@@ -1,7 +1,10 @@
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.db import transaction
+from django.db.models import Sum
 from django.shortcuts import render, get_object_or_404
 from rest_framework import viewsets, filters
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema
 from .models import SessaoCaixa, Venda, VendaItem, VendaPagamento, OperacaoCaixa
@@ -14,6 +17,25 @@ from .serializers import (
     OperacaoCaixaSerializer,
     VendaFinalizarSerializer,
 )
+
+
+def _assert_session_owner(sessao, user):
+    if sessao.operador_id != user.id:
+        raise PermissionDenied('A sessão de caixa pertence a outro operador.')
+
+
+def _assert_sale_owner(venda, user):
+    _assert_session_owner(venda.sessao, user)
+
+
+def _positive_decimal(value, field_name='valor'):
+    try:
+        parsed = Decimal(str(value)).quantize(Decimal('0.01'))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError({field_name: 'Informe um valor válido.'})
+    if parsed <= 0:
+        raise ValidationError({field_name: 'O valor deve ser maior que zero.'})
+    return parsed
 
 @extend_schema(tags=['Caixa'])
 class SessaoCaixaViewSet(viewsets.ModelViewSet):
@@ -34,6 +56,19 @@ class SessaoCaixaViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(operador=self.request.user)
 
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            sessao = SessaoCaixa.objects.select_for_update().get(pk=serializer.instance.pk)
+            _assert_session_owner(sessao, self.request.user)
+            serializer.instance = sessao
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        _assert_session_owner(instance, self.request.user)
+        if instance.status != 'ABERTA' or instance.venda_set.exists():
+            raise ValidationError('Não é possível excluir uma sessão utilizada ou fechada.')
+        instance.soft_delete()
+
     @action(detail=False, methods=['get'], url_path='ativa')
     def sessao_ativa(self, request):
         """Retorna a sessão de caixa aberta do usuário atual, se houver."""
@@ -46,21 +81,9 @@ class SessaoCaixaViewSet(viewsets.ModelViewSet):
     def fechar(self, request, pk=None):
         """Fecha a sessão de caixa e retorna o resumo financeiro."""
         from django.utils import timezone
-        sessao = self.get_object()
-
-        if sessao.status == 'FECHADA':
-            return Response({'erro': 'Este caixa já está fechado.'}, status=400)
-
-        # Impede fechar se houver vendas em aberto
-        vendas_abertas = Venda.objects.filter(sessao=sessao, status='EM_ABERTO').exists()
-        if vendas_abertas:
-            return Response({'erro': 'Não é possível fechar o caixa com vendas em aberto. Finalize ou cancele as vendas pendentes.'}, status=400)
-
         valor_contado = request.data.get('valor_contado')
         if valor_contado in (None, ''):
             return Response({'erro': 'Informe o valor contado no caixa.'}, status=400)
-
-        from decimal import Decimal, InvalidOperation
         try:
             valor_contado = Decimal(str(valor_contado)).quantize(Decimal('0.01'))
         except (InvalidOperation, TypeError, ValueError):
@@ -68,36 +91,38 @@ class SessaoCaixaViewSet(viewsets.ModelViewSet):
         if valor_contado < 0:
             return Response({'erro': 'O valor contado não pode ser negativo.'}, status=400)
 
-        # Calcula resumo
-        vendas = Venda.objects.filter(sessao=sessao, status='FINALIZADA')
-        pagamentos = VendaPagamento.objects.filter(venda__in=vendas)
+        with transaction.atomic():
+            sessao = SessaoCaixa.objects.select_for_update().get(pk=self.get_object().pk)
+            _assert_session_owner(sessao, request.user)
+            if sessao.status == 'FECHADA':
+                return Response({'erro': 'Este caixa já está fechado.'}, status=400)
+            if Venda.objects.filter(sessao=sessao, status='EM_ABERTO').exists():
+                return Response({'erro': 'Não é possível fechar o caixa com vendas em aberto. Finalize ou cancele as vendas pendentes.'}, status=400)
 
-        resumo = {
-            'total_vendas': sum(v.total for v in vendas),
-            'quantidade_vendas': vendas.count(),
-            'por_forma': {}
-        }
+            vendas = Venda.objects.filter(sessao=sessao, status='FINALIZADA')
+            pagamentos = VendaPagamento.objects.filter(venda__in=vendas)
+            resumo = {
+                'total_vendas': vendas.aggregate(total=Sum('total'))['total'] or Decimal('0'),
+                'quantidade_vendas': vendas.count(),
+                'por_forma': {},
+            }
+            for forma, _label in VendaPagamento.FORMA_CHOICES:
+                resumo['por_forma'][forma] = pagamentos.filter(forma=forma).aggregate(
+                    total=Sum('valor')
+                )['total'] or Decimal('0')
 
-        for forma, label in VendaPagamento.FORMA_CHOICES:
-            total_forma = sum(p.valor for p in pagamentos if p.forma == forma)
-            resumo['por_forma'][forma] = total_forma
+            total_dinheiro = resumo['por_forma'].get('DINHEIRO', Decimal('0'))
+            total_sangrias = sessao.operacoes.filter(tipo='SANGRIA').aggregate(total=Sum('valor'))['total'] or Decimal('0')
+            total_suprimentos = sessao.operacoes.filter(tipo='SUPRIMENTO').aggregate(total=Sum('valor'))['total'] or Decimal('0')
+            valor_esperado = (sessao.fundo_inicial or Decimal('0')) + total_dinheiro + total_suprimentos - total_sangrias
+            diferenca = valor_contado - valor_esperado
+            resumo.update({'valor_esperado': valor_esperado, 'valor_contado': valor_contado, 'diferenca': diferenca})
 
-        total_dinheiro = resumo['por_forma'].get('DINHEIRO', Decimal('0'))
-        total_sangrias = sum(op.valor for op in sessao.operacoes.filter(tipo='SANGRIA'))
-        total_suprimentos = sum(op.valor for op in sessao.operacoes.filter(tipo='SUPRIMENTO'))
-        valor_esperado = (sessao.fundo_inicial or Decimal('0')) + total_dinheiro + total_suprimentos - total_sangrias
-        diferenca = valor_contado - valor_esperado
-        resumo.update({
-            'valor_esperado': valor_esperado,
-            'valor_contado': valor_contado,
-            'diferenca': diferenca,
-        })
-
-        sessao.status = 'FECHADA'
-        sessao.data_fechamento = timezone.now()
-        sessao.valor_contado = valor_contado
-        sessao.diferenca_caixa = diferenca
-        sessao.save(update_fields=['status', 'data_fechamento', 'valor_contado', 'diferenca_caixa', 'updated_at'])
+            sessao.status = 'FECHADA'
+            sessao.data_fechamento = timezone.now()
+            sessao.valor_contado = valor_contado
+            sessao.diferenca_caixa = diferenca
+            sessao.save(update_fields=['status', 'data_fechamento', 'valor_contado', 'diferenca_caixa', 'updated_at'])
 
         return Response({
             'sessao': SessaoCaixaSerializer(sessao).data,
@@ -106,36 +131,42 @@ class SessaoCaixaViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='sangria')
     def sangria(self, request, pk=None):
-        sessao = self.get_object()
-        if sessao.status == 'FECHADA':
-            return Response({'erro': 'Caixa fechado.'}, status=400)
-
         valor = request.data.get('valor')
         motivo = request.data.get('motivo', '')
 
-        if not valor or float(valor) <= 0:
+        try:
+            valor = _positive_decimal(valor)
+        except ValidationError:
             return Response({'erro': 'Valor inválido.'}, status=400)
 
-        op = OperacaoCaixa.objects.create(
-            sessao=sessao, tipo='SANGRIA', valor=valor, motivo=motivo
-        )
+        with transaction.atomic():
+            sessao = SessaoCaixa.objects.select_for_update().get(pk=self.get_object().pk)
+            _assert_session_owner(sessao, request.user)
+            if sessao.status == 'FECHADA':
+                return Response({'erro': 'Caixa fechado.'}, status=400)
+            op = OperacaoCaixa.objects.create(
+                sessao=sessao, tipo='SANGRIA', valor=valor, motivo=motivo
+            )
         return Response(OperacaoCaixaSerializer(op).data, status=201)
 
     @action(detail=True, methods=['post'], url_path='suprimento')
     def suprimento(self, request, pk=None):
-        sessao = self.get_object()
-        if sessao.status == 'FECHADA':
-            return Response({'erro': 'Caixa fechado.'}, status=400)
-
         valor = request.data.get('valor')
         motivo = request.data.get('motivo', '')
 
-        if not valor or float(valor) <= 0:
+        try:
+            valor = _positive_decimal(valor)
+        except ValidationError:
             return Response({'erro': 'Valor inválido.'}, status=400)
 
-        op = OperacaoCaixa.objects.create(
-            sessao=sessao, tipo='SUPRIMENTO', valor=valor, motivo=motivo
-        )
+        with transaction.atomic():
+            sessao = SessaoCaixa.objects.select_for_update().get(pk=self.get_object().pk)
+            _assert_session_owner(sessao, request.user)
+            if sessao.status == 'FECHADA':
+                return Response({'erro': 'Caixa fechado.'}, status=400)
+            op = OperacaoCaixa.objects.create(
+                sessao=sessao, tipo='SUPRIMENTO', valor=valor, motivo=motivo
+            )
         return Response(OperacaoCaixaSerializer(op).data, status=201)
 
 
@@ -172,34 +203,32 @@ class VendaViewSet(viewsets.ModelViewSet):
 
         return queryset.order_by('-data')
 
-    @extend_schema(
-        summary="Salvar venda como orçamento",
-        description="Marca a venda atual como ORCAMENTO sem baixar estoque e sem exigir pagamentos.",
-        responses={200: VendaReadSerializer}
-    )
-    @action(detail=True, methods=['post'], url_path='salvar-orcamento')
-    def salvar_orcamento(self, request, pk=None):
-        venda = self.get_object()
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            venda = Venda.objects.select_for_update().select_related('sessao').get(
+                pk=serializer.instance.pk
+            )
+            _assert_sale_owner(venda, self.request.user)
+            if venda.status != 'EM_ABERTO' or venda.sessao.status != 'ABERTA':
+                raise ValidationError('A venda e o caixa devem estar abertos.')
+            serializer.instance = venda
+            serializer.save()
 
-        if venda.status != 'EM_ABERTO':
-            return Response({'erro': 'Apenas vendas em aberto podem ser salvas como orçamento.'}, status=400)
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            sessao = SessaoCaixa.objects.select_for_update().get(
+                pk=serializer.validated_data['sessao'].pk
+            )
+            _assert_session_owner(sessao, self.request.user)
+            if sessao.status != 'ABERTA':
+                raise ValidationError('A sessão de caixa está fechada.')
+            serializer.save(sessao=sessao)
 
-        cliente_id = request.data.get('cliente')
-
-        from decimal import Decimal, ROUND_HALF_UP
-        def quantize(val):
-            return Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
-        desconto = quantize(request.data.get('desconto', 0))
-
-        venda.status = 'ORCAMENTO'
-        venda.desconto = desconto
-        if cliente_id:
-            venda.cliente_id = cliente_id
-
-        venda.save()
-
-        return Response(VendaReadSerializer(venda).data)
+    def perform_destroy(self, instance):
+        _assert_sale_owner(instance, self.request.user)
+        if instance.status != 'EM_ABERTO':
+            raise ValidationError('Apenas vendas em aberto podem ser excluídas.')
+        instance.soft_delete()
 
     @extend_schema(
         summary="Finalizar uma venda",
@@ -209,132 +238,125 @@ class VendaViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=['post'], url_path='finalizar')
     def finalizar(self, request, pk=None):
-        # ... (Logica de finalização mantida igual, apenas retornando o serializer correto)
-        venda = self.get_object()
+        input_serializer = VendaFinalizarSerializer(data=request.data)
+        if not input_serializer.is_valid():
+            first_error = next(iter(input_serializer.errors.values()))
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return Response({'erro': str(first_error)}, status=400)
 
-        if venda.status != 'EM_ABERTO':
-            return Response({'erro': 'Apenas vendas em aberto podem ser finalizadas.'}, status=400)
+        validated = input_serializer.validated_data
+        pagamentos_data = [dict(payment) for payment in validated['pagamentos']]
+        desconto = validated['desconto']
+        cliente = validated.get('cliente')
 
-        pagamentos_data = request.data.get('pagamentos', [])
-        cliente_id = request.data.get('cliente')
+        with transaction.atomic():
+            venda = get_object_or_404(
+                Venda.objects.select_for_update().select_related('sessao', 'cliente'),
+                pk=pk,
+            )
+            _assert_sale_owner(venda, request.user)
+            if venda.status != 'EM_ABERTO':
+                return Response({'erro': 'Apenas vendas em aberto podem ser finalizadas.'}, status=400)
+            if venda.sessao.status != 'ABERTA':
+                return Response({'erro': 'A sessão de caixa está fechada.'}, status=400)
 
-        if not pagamentos_data:
-            return Response({'erro': 'Informe ao menos uma forma de pagamento.'}, status=400)
+            itens = list(venda.itens.select_for_update().select_related('produto'))
+            if not itens:
+                return Response({'erro': 'O carrinho está vazio.'}, status=400)
 
-        from decimal import Decimal, ROUND_HALF_UP
-        def quantize(val):
-            return Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            total = sum((item.subtotal for item in itens), Decimal('0')).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+            if desconto > total:
+                return Response({'erro': 'O desconto não pode ser maior que o total da venda.'}, status=400)
 
-        desconto = quantize(request.data.get('desconto', 0))
-        total_pago = quantize(sum(Decimal(str(p.get('valor', 0))) for p in pagamentos_data))
-        total_liquido = quantize(venda.total - desconto)
+            total_liquido = (total - desconto).quantize(Decimal('0.01'))
+            total_pago = sum((p['valor'] for p in pagamentos_data), Decimal('0')).quantize(Decimal('0.01'))
+            if total_pago < total_liquido:
+                return Response({
+                    'erro': f'O total dos pagamentos (R${total_pago:.2f}) não atinge o total líquido da venda (R${total_liquido:.2f}).'
+                }, status=400)
 
-        if total_pago < total_liquido - Decimal('0.05'):
-             return Response({
-                 'erro': f'O total dos pagamentos (R${total_pago:.2f}) não atinge o total líquido da venda (R${total_liquido:.2f}).'
-             }, status=400)
+            troco = total_pago - total_liquido
+            if troco > 0:
+                pagamento_dinheiro = next((p for p in pagamentos_data if p['forma'] == 'DINHEIRO'), None)
+                if not pagamento_dinheiro or troco >= pagamento_dinheiro['valor']:
+                    return Response({'erro': 'Pagamento excedente só é permitido como troco em dinheiro válido.'}, status=400)
+                pagamento_dinheiro['valor'] -= troco
 
-        troco = total_pago - total_liquido
-        if troco > Decimal('0.05'):
-            pagamento_dinheiro = next((p for p in pagamentos_data if str(p.get('forma', '')).strip().upper() == 'DINHEIRO'), None)
+            from apps.produtos.services import registrar_movimentacao
+            for item in itens:
+                registrar_movimentacao(
+                    produto_id=item.produto_id,
+                    quantidade=item.quantidade,
+                    tipo='SAIDA',
+                    motivo='VENDA',
+                    loja='Loja Principal',
+                    observacoes=f'Venda #{venda.id}',
+                )
 
-            if pagamento_dinheiro:
-                valor_em_dinheiro = Decimal(str(pagamento_dinheiro.get('valor', 0)))
-                if troco > valor_em_dinheiro + Decimal('0.05'):
-                     return Response({
-                        'erro': 'O troco é maior do que o valor pago em dinheiro, o que é inválido.'
-                     }, status=400)
+            for payment in pagamentos_data:
+                VendaPagamento.objects.create(venda=venda, **payment)
+                if payment['forma'] == 'FIADO':
+                    from datetime import timedelta
+                    from django.utils import timezone
+                    from apps.financeiro.models import ContaReceber
 
-                # Abate o troco no pagamento em dinheiro para que o caixa físico bata
-                pagamento_dinheiro['valor'] = float(valor_em_dinheiro - troco)
-            else:
-                # Se não tem dinheiro, mas o total é maior (ex: PIX arredondado pra cima)
-                # Apenas deixamos passar, o valor registrado será o valor cheio enviado.
-                pass
-        try:
-            with transaction.atomic():
-                itens = venda.itens.select_related('produto').all()
-                if not itens:
-                    raise ValueError('O carrinho está vazio.')
-
-                from apps.produtos.services import registrar_movimentacao
-
-                for item in itens:
-                    registrar_movimentacao(
-                        produto_id=item.produto_id,
-                        quantidade=item.quantidade,
-                        tipo='SAIDA',
-                        motivo='VENDA',
-                        loja='Loja Principal',
-                        observacoes=f'Venda #{venda.id}'
+                    sale_customer = cliente or venda.cliente
+                    ContaReceber.objects.create(
+                        descricao=f'Venda FIADO #{venda.id}',
+                        cliente_nome=sale_customer.nome if sale_customer else 'Consumidor Final',
+                        valor=payment['valor'],
+                        vencimento=timezone.now().date() + timedelta(days=30),
+                        status='PENDENTE',
+                        observacoes=f'Originada da Venda #{venda.id} no PDV.',
                     )
 
-                for p in pagamentos_data:
-                    VendaPagamento.objects.create(venda=venda, forma=p['forma'], valor=p['valor'])
-
-                    # Se for FIADO, gera Conta a Receber
-                    if str(p['forma']).strip().upper() == 'FIADO':
-                        from apps.financeiro.models import ContaReceber
-                        from django.utils import timezone
-                        from datetime import timedelta
-
-                        nome_cliente = "Consumidor Final"
-                        if cliente_id:
-                            from apps.clientes.models import Cliente
-                            try:
-                                cli = Cliente.objects.get(id=cliente_id)
-                                nome_cliente = cli.nome
-                            except:
-                                pass
-                        elif venda.cliente:
-                            nome_cliente = venda.cliente.nome
-
-                        ContaReceber.objects.create(
-                            descricao=f"Venda FIADO #{venda.id}",
-                            cliente_nome=nome_cliente,
-                            valor=p['valor'],
-                            vencimento=timezone.now().date() + timedelta(days=30), # Padrão 30 dias
-                            status='PENDENTE',
-                            observacoes=f'Originada da Venda #{venda.id} no PDV.'
-                        )
-
-                # SUCESSO TOTAL: Agora sim finalizamos a venda
-                venda.status = 'FINALIZADA'
-                venda.desconto = desconto
-                if cliente_id:
-                    venda.cliente_id = cliente_id
-
-                venda.save()
-
-        except Exception as e:
-            return Response({'erro': f'Erro ao finalizar: {str(e)}'}, status=400)
+            venda.total = total
+            venda.status = 'FINALIZADA'
+            venda.desconto = desconto
+            if 'cliente' in validated:
+                venda.cliente = cliente
+            venda.save(update_fields=['total', 'status', 'desconto', 'cliente', 'updated_at'])
 
         return Response(VendaReadSerializer(venda).data)
 
     @action(detail=True, methods=['post'], url_path='cancelar')
     def cancelar(self, request, pk=None):
-        venda = self.get_object()
-        if venda.status == 'CANCELADA':
-            return Response({'erro': 'Esta venda já está cancelada.'}, status=400)
+        with transaction.atomic():
+            venda = get_object_or_404(
+                Venda.objects.select_for_update().select_related('sessao'), pk=pk
+            )
+            _assert_sale_owner(venda, request.user)
+            if venda.status == 'CANCELADA':
+                return Response({'erro': 'Esta venda já está cancelada.'}, status=400)
 
-        try:
-            with transaction.atomic():
-                if venda.status == 'FINALIZADA':
-                    from apps.produtos.services import registrar_movimentacao
-                    for item in venda.itens.all():
-                        registrar_movimentacao(
-                            produto_id=item.produto_id,
-                            quantidade=item.quantidade,
-                            tipo='ENTRADA',
-                            motivo='DEVOLUCAO',
-                            loja='Loja Principal',
-                            observacoes=f'Estorno Venda #{venda.id} (Cancelamento)'
-                        )
+            if venda.status == 'FINALIZADA':
+                from apps.produtos.services import registrar_movimentacao
+                for item in venda.itens.select_for_update():
+                    registrar_movimentacao(
+                        produto_id=item.produto_id,
+                        quantidade=item.quantidade,
+                        tipo='ENTRADA',
+                        motivo='DEVOLUCAO',
+                        loja='Loja Principal',
+                        observacoes=f'Estorno Venda #{venda.id} (Cancelamento)',
+                    )
 
-                venda.status = 'CANCELADA'
-                venda.save()
-        except Exception as e:
-            return Response({'erro': str(e)}, status=400)
+                # Um FIADO ainda pendente deixa de existir junto com a venda.
+                # Recebíveis já liquidados são preservados como registro financeiro.
+                from apps.financeiro.models import ContaReceber
+                recebiveis_pendentes = ContaReceber.objects.select_for_update().filter(
+                    status='PENDENTE',
+                    descricao=f'Venda FIADO #{venda.id}',
+                    observacoes=f'Originada da Venda #{venda.id} no PDV.',
+                )
+                for recebivel in recebiveis_pendentes:
+                    recebivel.soft_delete()
+
+            venda.status = 'CANCELADA'
+            venda.save(update_fields=['status', 'updated_at'])
 
         return Response(VendaReadSerializer(venda).data)
 
@@ -342,12 +364,43 @@ class VendaItemViewSet(viewsets.ModelViewSet):
     queryset = VendaItem.objects.all().select_related('produto')
     serializer_class = VendaItemSerializer
 
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            venda = Venda.objects.select_for_update().select_related('sessao').get(
+                pk=serializer.validated_data['venda'].pk
+            )
+            _assert_sale_owner(venda, self.request.user)
+            if venda.status != 'EM_ABERTO' or venda.sessao.status != 'ABERTA':
+                raise ValidationError('A venda e o caixa devem estar abertos.')
+            serializer.save(venda=venda)
 
-class VendaPagamentoViewSet(viewsets.ModelViewSet):
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            item = VendaItem.objects.select_for_update().select_related('venda__sessao').get(
+                pk=serializer.instance.pk
+            )
+            _assert_sale_owner(item.venda, self.request.user)
+            if item.venda.status != 'EM_ABERTO' or item.venda.sessao.status != 'ABERTA':
+                raise ValidationError('A venda e o caixa devem estar abertos.')
+            serializer.instance = item
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            item = VendaItem.objects.select_for_update().select_related('venda__sessao').get(
+                pk=instance.pk
+            )
+            _assert_sale_owner(item.venda, self.request.user)
+            if item.venda.status != 'EM_ABERTO' or item.venda.sessao.status != 'ABERTA':
+                raise ValidationError('A venda e o caixa devem estar abertos.')
+            item.delete()
+
+
+class VendaPagamentoViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = VendaPagamento.objects.all()
     serializer_class = VendaPagamentoSerializer
 
-class OperacaoCaixaViewSet(viewsets.ModelViewSet):
+class OperacaoCaixaViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = OperacaoCaixa.objects.all()
     serializer_class = OperacaoCaixaSerializer
 
