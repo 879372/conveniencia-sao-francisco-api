@@ -377,6 +377,20 @@ class VendaItemViewSet(viewsets.ModelViewSet):
             _assert_sale_owner(venda, self.request.user)
             if venda.status != 'EM_ABERTO' or venda.sessao.status != 'ABERTA':
                 raise ValidationError('A venda e o caixa devem estar abertos.')
+
+            # Mesmo produto bipado de novo: soma na linha existente em vez de
+            # criar outra, mantendo o carrinho igual ao que o PDV exibe.
+            produto = serializer.validated_data['produto']
+            existente = (
+                venda.itens.select_for_update()
+                .filter(produto=produto, preco_unitario=produto.preco_venda)
+                .first()
+            )
+            if existente:
+                existente.quantidade += serializer.validated_data['quantidade']
+                existente.save()
+                serializer.instance = existente
+                return
             serializer.save(venda=venda)
 
     def perform_update(self, serializer):

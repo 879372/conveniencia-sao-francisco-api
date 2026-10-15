@@ -54,6 +54,27 @@ class ProdutoViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+    @action(detail=False, methods=['get'], url_path='por-codigo')
+    def por_codigo(self, request):
+        """Busca EXATA usada pelo leitor de código de barras no PDV.
+
+        Diferente da busca-pdv (que usa icontains para listar sugestões), aqui
+        o código precisa bater por completo, para que um código parcial nunca
+        adicione outro produto. Prioriza o código de barras; o código interno
+        (codigo_legado) só é usado quando nenhum código de barras corresponde.
+        """
+        codigo = request.query_params.get('codigo', '').strip()
+        if not codigo:
+            return Response([])
+
+        ativos = Produto.objects.filter(ativo=True)
+        produtos = list(ativos.filter(codigo_barras=codigo)[:5])
+        if not produtos and codigo.isdigit():
+            produtos = list(ativos.filter(codigo_legado=int(codigo))[:5])
+
+        serializer = ProdutoSimplificadoSerializer(produtos, many=True)
+        return Response(serializer.data)
+
     @action(detail=True, methods=['get'])
     def movimentacoes(self, request, pk=None):
         """Retorna o histórico de movimentações (Kardex) do produto"""

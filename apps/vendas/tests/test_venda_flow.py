@@ -344,3 +344,24 @@ def test_fechar_caixa_exige_conferencia_e_calcula_diferenca(auth_client, admin_u
     assert sessao.status == 'FECHADA'
     assert sessao.valor_contado == Decimal('148.00')
     assert sessao.diferenca_caixa == Decimal('-2.00')
+
+
+@pytest.mark.django_db
+def test_bipar_mesmo_produto_soma_na_mesma_linha(auth_client, admin_user):
+    sessao = SessaoCaixaFactory(operador=admin_user, status='ABERTA')
+    venda = VendaFactory(sessao=sessao, total=Decimal('0.00'), status='EM_ABERTO')
+    produto = ProdutoFactory(preco_venda=Decimal('5.00'))
+
+    for _ in range(2):
+        response = auth_client.post('/api/venda-itens/', {
+            'venda': venda.id,
+            'produto': produto.id,
+            'quantidade': '1.000',
+        }, format='json')
+        assert response.status_code == 201
+
+    assert venda.itens.count() == 1
+    item = venda.itens.get()
+    assert item.quantidade == Decimal('2.000')
+    venda.refresh_from_db()
+    assert venda.total == Decimal('10.00')
