@@ -56,6 +56,18 @@ class SessaoCaixaViewSet(viewsets.ModelViewSet):
         if vendas_abertas:
             return Response({'erro': 'Não é possível fechar o caixa com vendas em aberto. Finalize ou cancele as vendas pendentes.'}, status=400)
 
+        valor_contado = request.data.get('valor_contado')
+        if valor_contado in (None, ''):
+            return Response({'erro': 'Informe o valor contado no caixa.'}, status=400)
+
+        from decimal import Decimal, InvalidOperation
+        try:
+            valor_contado = Decimal(str(valor_contado)).quantize(Decimal('0.01'))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({'erro': 'Valor contado inválido.'}, status=400)
+        if valor_contado < 0:
+            return Response({'erro': 'O valor contado não pode ser negativo.'}, status=400)
+
         # Calcula resumo
         vendas = Venda.objects.filter(sessao=sessao, status='FINALIZADA')
         pagamentos = VendaPagamento.objects.filter(venda__in=vendas)
@@ -70,9 +82,22 @@ class SessaoCaixaViewSet(viewsets.ModelViewSet):
             total_forma = sum(p.valor for p in pagamentos if p.forma == forma)
             resumo['por_forma'][forma] = total_forma
 
+        total_dinheiro = resumo['por_forma'].get('DINHEIRO', Decimal('0'))
+        total_sangrias = sum(op.valor for op in sessao.operacoes.filter(tipo='SANGRIA'))
+        total_suprimentos = sum(op.valor for op in sessao.operacoes.filter(tipo='SUPRIMENTO'))
+        valor_esperado = (sessao.fundo_inicial or Decimal('0')) + total_dinheiro + total_suprimentos - total_sangrias
+        diferenca = valor_contado - valor_esperado
+        resumo.update({
+            'valor_esperado': valor_esperado,
+            'valor_contado': valor_contado,
+            'diferenca': diferenca,
+        })
+
         sessao.status = 'FECHADA'
         sessao.data_fechamento = timezone.now()
-        sessao.save()
+        sessao.valor_contado = valor_contado
+        sessao.diferenca_caixa = diferenca
+        sessao.save(update_fields=['status', 'data_fechamento', 'valor_contado', 'diferenca_caixa', 'updated_at'])
 
         return Response({
             'sessao': SessaoCaixaSerializer(sessao).data,

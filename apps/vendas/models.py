@@ -12,6 +12,8 @@ class SessaoCaixa(BaseModel):
     data_abertura = models.DateTimeField(auto_now_add=True)
     data_fechamento = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='ABERTA')
+    valor_contado = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    diferenca_caixa = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     observacoes = models.TextField(blank=True)
 
     objects = ActiveManager()

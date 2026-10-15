@@ -4,7 +4,8 @@ from rest_framework.response import Response
 from django.db import connection
 from django.db.models import Sum, Avg, Count, Q
 from django.utils import timezone
-from datetime import timedelta
+from calendar import monthrange
+from datetime import date, timedelta
 
 @api_view(["GET"])
 @permission_classes([AllowAny])
@@ -102,13 +103,21 @@ def dashboard_stats(request):
         key=lambda x: -x['total']
     )
 
-    # 4. Gráfico de 7 dias
+    # 4. Movimento diário do mês selecionado (ou mês atual)
     grafico_vendas = []
-    for i in range(6, -1, -1):
-        dia = today - timedelta(days=i)
+    if data_inicio:
+        graph_reference = date.fromisoformat(str(data_inicio))
+    else:
+        graph_reference = today
+    graph_start = graph_reference.replace(day=1)
+    graph_last_day = monthrange(graph_start.year, graph_start.month)[1]
+    graph_end = min(today, graph_start.replace(day=graph_last_day)) if graph_start.month == today.month and graph_start.year == today.year else graph_start.replace(day=graph_last_day)
+
+    for offset in range((graph_end - graph_start).days + 1):
+        dia = graph_start + timedelta(days=offset)
         valor_dia = Venda.objects.filter(status='FINALIZADA', created_at__date=dia).aggregate(total=Sum('total'))['total'] or 0
         grafico_vendas.append({
-            "data": dia.strftime("%d/%m"),
+            "data": dia.strftime("%d"),
             "total": float(valor_dia)
         })
 
@@ -128,6 +137,9 @@ def dashboard_stats(request):
         "total_vendas_hoje": total_vendas_hoje,
         "faturamento_mes": float(faturamento_periodo),
         "compras_mes": float(compras_periodo),
+        "total_descontos": float(vendas_periodo.aggregate(total=Sum('desconto'))['total'] or 0),
+        "ticket_medio": float(vendas_periodo.aggregate(media=Avg('total'))['media'] or 0),
+        "quantidade_vendas_periodo": vendas_periodo.count(),
         "grafico_vendas": grafico_vendas,
         "lucro_por_categoria": lucro_ranking,
         "produtos_ruptura": produtos_ruptura

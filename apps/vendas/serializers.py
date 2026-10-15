@@ -73,7 +73,8 @@ class SessaoCaixaSerializer(serializers.ModelSerializer):
         model = SessaoCaixa
         fields = [
             'id', 'operador', 'operador_nome', 'fundo_inicial',
-            'data_abertura', 'data_fechamento', 'status', 'created_at',
+            'data_abertura', 'data_fechamento', 'status', 'valor_contado',
+            'diferenca_caixa', 'created_at',
             # campos calculados / aliases:
             'aberta_em', 'fechada_em',
             'total_vendas', 'total_sangrias', 'total_suprimentos', 'saldo_final_calculado',
@@ -100,11 +101,13 @@ class SessaoCaixaSerializer(serializers.ModelSerializer):
     def get_saldo_final_calculado(self, obj):
         from django.db.models import Sum
         from .models import Venda, OperacaoCaixa
-        total_vendas = Venda.objects.filter(sessao=obj, status='FINALIZADA').aggregate(t=Sum('total'))['t'] or 0
+        total_dinheiro = VendaPagamento.objects.filter(
+            venda__sessao=obj, venda__status='FINALIZADA', forma='DINHEIRO'
+        ).aggregate(t=Sum('valor'))['t'] or 0
         total_sangrias = OperacaoCaixa.objects.filter(sessao=obj, tipo='SANGRIA').aggregate(t=Sum('valor'))['t'] or 0
         total_suprimentos = OperacaoCaixa.objects.filter(sessao=obj, tipo='SUPRIMENTO').aggregate(t=Sum('valor'))['t'] or 0
         fundo = obj.fundo_inicial or 0
-        saldo = fundo + total_vendas + total_suprimentos - total_sangrias
+        saldo = fundo + total_dinheiro + total_suprimentos - total_sangrias
         return str(saldo)
 
 

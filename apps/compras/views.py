@@ -1,10 +1,6 @@
-from rest_framework import viewsets, filters, status
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from django.db import transaction
+from rest_framework import viewsets, filters
 from .models import NotaCompra
 from .serializers import NotaCompraSerializer, NotaCompraReadSerializer
-from apps.produtos.services import registrar_movimentacao
 
 
 class NotaCompraViewSet(viewsets.ModelViewSet):
@@ -32,45 +28,3 @@ class NotaCompraViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             return NotaCompraReadSerializer
         return NotaCompraSerializer
-
-    @action(detail=True, methods=['post'])
-    def receber(self, request, pk=None):
-        """Finaliza o recebimento da nota e atualiza o estoque"""
-        nota = self.get_object()
-
-        if nota.status == 'RECEBIDA':
-            return Response({'erro': 'Esta nota já foi recebida.'}, status=400)
-
-        if nota.status == 'CANCELADA':
-            return Response({'erro': 'Esta nota está cancelada.'}, status=400)
-
-        with transaction.atomic():
-            for item in nota.itens.all():
-                if item.produto:
-                    registrar_movimentacao(
-                        produto_id=item.produto.id,
-                        tipo='ENTRADA',
-                        quantidade=item.quantidade,
-                        motivo='COMPRA',
-                        loja='Loja Principal',
-                        observacoes=f"Recebimento da compra {nota.numero_documento or nota.id}"
-                    )
-
-            nota.status = 'RECEBIDA'
-            nota.save()
-
-            # Gera Conta a Pagar para o fornecedor automaticamente
-            from apps.financeiro.models import ContaPagar
-            from django.utils import timezone
-            from datetime import timedelta
-
-            ContaPagar.objects.create(
-                descricao=f"Compra {nota.numero_documento or nota.id} - {nota.fornecedor}",
-                fornecedor=nota.fornecedor,
-                valor=nota.valor_total,
-                vencimento=timezone.now().date() + timedelta(days=30),
-                status='PENDENTE',
-                observacoes=f'Gerado automaticamente ao confirmar recebimento da compra #{nota.id}.'
-            )
-
-        return Response({'status': 'Compra recebida, estoque atualizado e conta a pagar gerada.'})

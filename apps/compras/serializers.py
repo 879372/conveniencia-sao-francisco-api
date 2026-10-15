@@ -30,15 +30,27 @@ class NotaCompraSerializer(serializers.ModelSerializer):
             'data_emissao', 'data_entrada', 'valor_total',
             'status', 'observacoes', 'itens'
         ]
-        read_only_fields = ['id', 'data_entrada']
+        read_only_fields = ['id', 'data_entrada', 'status']
 
     def create(self, validated_data):
         itens_data = validated_data.pop('itens', [])
+        # Compras são apenas registros de entrada, sem fluxo de pendência.
+        validated_data['status'] = 'RECEBIDA'
 
         with transaction.atomic():
             nota = NotaCompra.objects.create(**validated_data)
             for item_data in itens_data:
-                ItemNotaCompra.objects.create(nota=nota, **item_data)
+                item = ItemNotaCompra.objects.create(nota=nota, **item_data)
+                if item.produto:
+                    from apps.produtos.services import registrar_movimentacao
+                    registrar_movimentacao(
+                        produto_id=item.produto_id,
+                        tipo='ENTRADA',
+                        quantidade=item.quantidade,
+                        motivo='COMPRA',
+                        loja='Loja Principal',
+                        observacoes=f"Entrada da compra {nota.numero_documento or nota.id}",
+                    )
             return nota
 
 

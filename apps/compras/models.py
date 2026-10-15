@@ -4,14 +4,14 @@ from apps.core.models import BaseModel, ActiveManager
 
 
 class NotaCompra(BaseModel):
-    STATUS_CHOICES = [('PENDENTE', 'Pendente'), ('RECEBIDA', 'Recebida'), ('CANCELADA', 'Cancelada')]
+    STATUS_CHOICES = [('RECEBIDA', 'Registrada')]
     numero_documento = models.CharField(max_length=50, blank=True)
     fornecedor = models.CharField(max_length=255)
     cnpj_fornecedor = models.CharField(max_length=20, blank=True)
     data_emissao = models.DateField(null=True, blank=True)
     data_entrada = models.DateField(auto_now_add=True)
     valor_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDENTE')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='RECEBIDA')
     observacoes = models.TextField(blank=True)
 
     objects = ActiveManager()

@@ -2,13 +2,14 @@ from decimal import Decimal
 
 import pytest
 
+from apps.compras.models import NotaCompra
 from apps.financeiro.models import ContaPagar
 from apps.produtos.models import EstoqueLoja, MovimentacaoEstoque
 from apps.produtos.tests.factories import EstoqueLojaFactory
 
 
 @pytest.mark.django_db
-def test_registrar_e_receber_compra_atualiza_estoque_e_financeiro(auth_client):
+def test_registrar_compra_confirma_entrada_sem_gerar_conta_pagar(auth_client):
     estoque = EstoqueLojaFactory(
         quantidade=Decimal('4.000'),
         loja='Loja Principal',
@@ -31,21 +32,15 @@ def test_registrar_e_receber_compra_atualiza_estoque_e_financeiro(auth_client):
     assert 'xml_nfe' not in criada.data
     assert 'chave_acesso' not in criada.data
 
-    recebida = auth_client.post(
-        f"/api/compras/{criada.data['id']}/receber/",
-        {},
-        format='json',
-    )
-    assert recebida.status_code == 200
-
     estoque.refresh_from_db()
     assert estoque.quantidade == Decimal('7.000')
+    assert NotaCompra.objects.get(pk=criada.data['id']).status == 'RECEBIDA'
     assert MovimentacaoEstoque.objects.filter(
         produto=estoque.produto,
         tipo='ENTRADA',
         motivo='COMPRA',
     ).exists()
-    assert ContaPagar.objects.filter(
+    assert not ContaPagar.objects.filter(
         fornecedor='Fornecedor Teste',
         valor=Decimal('37.50'),
     ).exists()
