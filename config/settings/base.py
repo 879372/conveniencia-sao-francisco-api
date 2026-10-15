@@ -118,9 +118,12 @@ SPECTACULAR_SETTINGS = {
 }
 
 # JWT
+# Sessão deslizante: cada renovação entrega um refresh novo com validade cheia,
+# então quem usa o sistema não é deslogado. Só expira após JWT_REFRESH_DAYS
+# sem nenhum acesso (ou no "Sair").
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(hours=8),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=config('JWT_REFRESH_DAYS', default=365, cast=int)),
     'ROTATE_REFRESH_TOKENS': True,
 }
 
